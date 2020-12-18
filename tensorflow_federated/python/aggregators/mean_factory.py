@@ -31,16 +31,21 @@ from tensorflow_federated.python.core.templates import measured_process
 _InnerFactoryType = factory.UnweightedAggregationFactory
 
 
-class MeanFactory(factory.WeightedAggregationFactory):
+class MeanFactory(factory.UnweightedAggregationFactory,
+                  factory.WeightedAggregationFactory):
   """`AggregationProcessFactory` for mean.
 
-  The created `tff.templates.AggregationProcess` computes a weighted mean of
+  The created `tff.templates.AggregationProcess` computes a (weighted) mean of
   values placed at `CLIENTS`, and outputs the mean placed at `SERVER`.
 
-  The input arguments of the `next` attribute of the process are
-  `<state, value, weight>`, where `weight` is a scalar broadcasted to the
-  structure of `value`, and the weighted mean refers to the expression
+  For `create_weighted`, the input arguments of the `next` attribute of the
+  process are `<state, value, weight>`, where `weight` is a scalar broadcasted
+  to the structure of `value`, and the weighted mean refers to the expression
   `sum(value * weight) / sum(weight)`.
+
+  For `create_unweighted`, the input arguments of the `next` attribute of the
+  process are `<state, value>`, and the mean refers to the expression
+  `sum(value) / count(value)`.
 
   The implementation is parameterized by two inner aggregation factories
   responsible for the summations above, with the following high-level steps.
@@ -93,6 +98,45 @@ class MeanFactory(factory.WeightedAggregationFactory):
     py_typecheck.check_type(no_nan_division, bool)
     self._no_nan_division = no_nan_division
 
+  def create_unweighted(
+      self,
+      value_type: factory.ValueType) -> aggregation_process.AggregationProcess:
+    py_typecheck.check_type(value_type, factory.ValueType.__args__)
+
+    if not all([t.dtype.is_floating for t in structure.flatten(value_type)]):
+      raise TypeError(f'All values in provided value_type must be of floating '
+                      f'dtype. Provided value_type: {value_type}')
+
+    value_sum_process = self._value_sum_factory.create_unweighted(value_type)
+
+    @computations.federated_computation()
+    def init_fn():
+      state = collections.OrderedDict(
+          value_sum_process=value_sum_process.initialize())
+      return intrinsics.federated_zip(state)
+
+    @computations.federated_computation(init_fn.type_signature.result,
+                                        computation_types.FederatedType(
+                                            value_type, placements.CLIENTS))
+    def next_fn(state, value):
+      value_sum_output = value_sum_process.next(state['value_sum_process'],
+                                                value)
+      count = intrinsics.federated_sum(
+          intrinsics.federated_value(1, placements.CLIENTS))
+
+      mean_value = intrinsics.federated_map(
+          _div_no_nan if self._no_nan_division else _div,
+          (value_sum_output.result, count))
+
+      state = collections.OrderedDict(value_sum_process=value_sum_output.state)
+      measurements = collections.OrderedDict(
+          value_sum_process=value_sum_output.measurements)
+      return measured_process.MeasuredProcessOutput(
+          intrinsics.federated_zip(state), mean_value,
+          intrinsics.federated_zip(measurements))
+
+    return aggregation_process.AggregationProcess(init_fn, next_fn)
+
   def create_weighted(
       self, value_type: factory.ValueType,
       weight_type: factory.ValueType) -> aggregation_process.AggregationProcess:
@@ -128,12 +172,9 @@ class MeanFactory(factory.WeightedAggregationFactory):
                                               weight)
 
       # Server computation.
-      if self._no_nan_division:
-        weighted_mean_value = intrinsics.federated_map(
-            _div_no_nan, (value_output.result, weight_output.result))
-      else:
-        weighted_mean_value = intrinsics.federated_map(
-            _div, (value_output.result, weight_output.result))
+      weighted_mean_value = intrinsics.federated_map(
+          _div_no_nan if self._no_nan_division else _div,
+          (value_output.result, weight_output.result))
 
       # Output preparation.
       state = collections.OrderedDict(
